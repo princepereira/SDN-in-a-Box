@@ -1028,8 +1028,14 @@ else {
     Write-Host "`$L1VmAdminPassword is empty; skipping unattend.xml injection (manual first-boot setup)."
 }
 
-# ---- Use the existing External virtual switch (create one if none exists) ----
-$switchName = (Get-VMSwitch | Where-Object SwitchType -eq 'External' | Select-Object -First 1).Name
+# ---- Pick a virtual switch: prefer the built-in 'Default Switch', then any External switch ----
+$switchName = (Get-VMSwitch | Where-Object Name -eq 'Default Switch' | Select-Object -First 1).Name
+if ($switchName) {
+    Write-Host "'Default Switch' already exists; skipping External switch creation."
+}
+if (-not $switchName) {
+    $switchName = (Get-VMSwitch | Where-Object SwitchType -eq 'External' | Select-Object -First 1).Name
+}
 if (-not $switchName) {
     Write-Host "No External virtual switch found. Creating one..."
 
