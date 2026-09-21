@@ -4,8 +4,9 @@
 #
 #  Usage:
 #    .\Create-L1Vm-Windows.ps1 -VHDXPath "C:\VHDs\my-image.vhdx" -L1VMName "L1-GeCur-2025"
-#    .\Create-L1Vm-Windows.ps1 -RemoteVHDXPath "\\share\path\image.vhdx" -L1VMName "L1-GeCur-2025"
-#    .\Create-L1Vm-Windows.ps1 -Branch ge_current_directiof_nv -L1VMName "L1-GeCur-2025"
+#    .\Create-L1Vm-Windows.ps1 -VHDXPath "C:\VHDs\my-image.vhdx" -InstallContainerd
+#    .\Create-L1Vm-Windows.ps1 -VHDXPath "C:\VHDs\my-image.vhdx" -InstallContainerd `
+#         -NetworkMode l2bridge -ContainerIsolation hyperv -RunContainerdValidation
 #
 #  NOTE: The Administrator password ($L1VmAdminPassword), locale ($Locale), and
 #        time zone ($TimeZone) are constants set near the top of the script.
@@ -13,32 +14,44 @@
 
 [CmdletBinding()]
 param(
-    # Winbuilds branch name, e.g. ge_current_directiof_nv.
-    # When supplied, the LATEST vhdx for the branch is copied from winbuilds.
-    # Required unless -VHDXPath is supplied.
-    [Parameter(Mandatory = $false)]
-    [string]$Branch,
-
     # Name of the VM to create.
     [Parameter(Mandatory = $false)]
     [string]$L1VMName = "L1-GeCurNv-2025",
 
-    # Explicit path to an existing .vhdx. When set, it is used directly and
-    # -Branch is ignored.
-    [Parameter(Mandatory = $false)]
+    # Explicit path to an existing .vhdx used as the base disk for the VM.
+    [Parameter(Mandatory = $true)]
     [string]$VHDXPath,
 
-    # Path to a .vhdx (local or on a share) that is first robocopied into
-    # C:\VHDs, and the local copy is then used as the base. Takes precedence
-    # over -Branch; ignored when -VHDXPath is supplied.
+    # When set, runs Install-ContainerdHnsVfp.ps1 INSIDE the guest (after the
+    # host helper scripts are copied) to install containerd + Windows CNI +
+    # HNS network + VFP + crictl. Requires in-guest setup (ignored with
+    # -SkipGuestSetup or when $L1VmAdminPassword is empty).
     [Parameter(Mandatory = $false)]
-    [string]$RemoteVHDXPath
+    [switch]$InstallContainerd,
+
+    # HNS network type the in-guest installer creates (only used with
+    # -InstallContainerd). Forwarded to Install-ContainerdHnsVfp.ps1 -NetworkMode.
+    [Parameter(Mandatory = $false)]
+    [ValidateSet('l2bridge', 'overlay', 'nat')]
+    [string]$NetworkMode = 'l2bridge',
+
+    # Container isolation used by the installer's validation pod (only used with
+    # -InstallContainerd -RunContainerdValidation). hyperv = Hyper-V isolated
+    # (cross-build safe); process = process-isolated (guest build must match the
+    # image). Forwarded to Install-ContainerdHnsVfp.ps1 -ContainerIsolation.
+    [Parameter(Mandatory = $false)]
+    [ValidateSet('hyperv', 'process')]
+    [string]$ContainerIsolation = 'hyperv',
+
+    # Run the installer's end-to-end CNI/HNS/VFP pod-sandbox validation
+    # (forwarded to Install-ContainerdHnsVfp.ps1 -RunValidation).
+    [Parameter(Mandatory = $false)]
+    [switch]$RunContainerdValidation
 )
 
 # ---- Static config ----
 $vmName        = $L1VMName
 $localVhdRoot  = "C:\VHDs"
-$winbuildsRoot = "\\winbuilds\release"
 
 # ---- Constants (edit these instead of passing arguments) ----
 $L1VmAdminPassword = "Admin@123"           # Administrator password set on first boot
@@ -112,127 +125,17 @@ $MobaXtermBinDir  = 'C:\Tools\bin'         # added to PATH; holds a 'mobaxterm' 
 
 # ---- Host scripts to copy INTO the guest (after guest setup) ----
 $GuestScriptsDir   = "C:\scripts"            # destination folder INSIDE the guest
-# Files are resolved relative to THIS script's folder if not absolute.
-$HostFilesToCopy   = @('Create-L2Vm-Linux.ps1', 'Enable-VfpPortConnectivity.ps1')
+# Copy ALL .ps1 helpers from THIS script's folder into the guest, except this
+# bootstrap script itself (which runs on the HOST). New scripts added to the
+# repo are therefore picked up and copied automatically.
+$ThisScriptName    = 'Create-L1Vm-Windows.ps1'
+$ScriptSourceRoot  = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
+$HostFilesToCopy   = @(
+    Get-ChildItem -Path $ScriptSourceRoot -Filter '*.ps1' -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne $ThisScriptName } |
+        Select-Object -ExpandProperty Name
+)
 
-# ---- Helper: find the latest vhdx for a branch on winbuilds ----
-# Prefers the Desktop Experience (GUI) Datacenter image and avoids Server Core,
-# so -Branch does not accidentally pick a Core (no-GUI) vhdx.
-$PreferVhdxIncludePattern = 'serverdatacenter'   # desired SKU substring (case-insensitive)
-$PreferVhdxExcludePattern = 'core'               # skip Server Core variants
-
-function Get-LatestWinbuildsVhdx {
-    param([string]$Branch)
-
-    $branchPath = Join-Path $winbuildsRoot $Branch
-    if (-not (Test-Path $branchPath)) {
-        throw "Branch path not found on winbuilds: $branchPath"
-    }
-
-    # Iterate build folders newest-first (folder names sort chronologically).
-    $buildFolders = Get-ChildItem -Path $branchPath -Directory -ErrorAction Stop |
-                    Sort-Object Name -Descending
-
-    foreach ($bf in $buildFolders) {
-        # All vhdx files that live under a 'vhdx' path segment, newest first.
-        $candidates = Get-ChildItem -Path $bf.FullName -Recurse -Filter *.vhdx -ErrorAction SilentlyContinue |
-                      Where-Object { $_.FullName -match '\\vhdx\\' } |
-                      Sort-Object LastWriteTime -Descending
-        if (-not $candidates) { continue }
-
-        # 1) Prefer Desktop Experience Datacenter (include pattern, NOT Core).
-        $preferred = $candidates | Where-Object {
-            $_.FullName -match [regex]::Escape($PreferVhdxIncludePattern) -and
-            $_.FullName -notmatch [regex]::Escape($PreferVhdxExcludePattern)
-        } | Select-Object -First 1
-        if ($preferred) {
-            Write-Host "Selected Desktop Experience image: $($preferred.FullName)"
-            return $preferred
-        }
-
-        # 2) Otherwise any non-Core vhdx.
-        $nonCore = $candidates | Where-Object { $_.FullName -notmatch [regex]::Escape($PreferVhdxExcludePattern) } |
-                   Select-Object -First 1
-        if ($nonCore) {
-            Write-Host "No '$PreferVhdxIncludePattern' image; using non-Core image: $($nonCore.FullName)"
-            return $nonCore
-        }
-
-        # 3) Last resort: newest vhdx (may be Server Core).
-        $any = $candidates | Select-Object -First 1
-        Write-Host "WARNING: only Server Core images found; using: $($any.FullName)"
-        return $any
-    }
-    return $null
-}
-
-# ---- Helper: robocopy a vhdx file into C:\VHDs ----
-function Copy-VhdxLocally {
-    param([System.IO.FileInfo]$VhdxFile)
-
-    # Guard: source path must contain a 'vhdx' segment.
-    if ($VhdxFile.FullName -notmatch '\\vhdx\\') {
-        throw "Refusing to copy: source path does not contain 'vhdx' -> $($VhdxFile.FullName)"
-    }
-
-    if (-not (Test-Path $localVhdRoot)) {
-        Write-Host "Creating local VHD directory: $localVhdRoot"
-        New-Item -ItemType Directory -Path $localVhdRoot -Force | Out-Null
-    }
-
-    $srcDir   = $VhdxFile.DirectoryName
-    $fileName = $VhdxFile.Name
-    Write-Host "Robocopy: $srcDir\$fileName  ->  $localVhdRoot"
-
-    robocopy $srcDir $localVhdRoot $fileName /Z /J /R:3 /W:5 | Out-Host
-
-    # Robocopy exit codes 0-7 indicate success; 8+ indicate failure.
-    if ($LASTEXITCODE -ge 8) {
-        throw "Robocopy failed with exit code $LASTEXITCODE"
-    }
-    $global:LASTEXITCODE = 0
-
-    return (Join-Path $localVhdRoot $fileName)
-}
-
-# ---- Helper: robocopy an arbitrary vhdx file (local or share) into C:\VHDs ----
-function Copy-RemoteVhdxLocally {
-    param([Parameter(Mandatory)][string]$SourcePath)
-
-    if ($SourcePath -notmatch '\.vhdx$') {
-        throw "Refusing to copy: -RemoteVHDXPath must point to a .vhdx file -> $SourcePath"
-    }
-    if (-not (Test-Path $SourcePath)) {
-        throw "-RemoteVHDXPath does not exist: $SourcePath"
-    }
-
-    if (-not (Test-Path $localVhdRoot)) {
-        Write-Host "Creating local VHD directory: $localVhdRoot"
-        New-Item -ItemType Directory -Path $localVhdRoot -Force | Out-Null
-    }
-
-    $srcItem  = Get-Item -LiteralPath $SourcePath
-    $srcDir   = $srcItem.DirectoryName
-    $fileName = $srcItem.Name
-    $dest     = Join-Path $localVhdRoot $fileName
-
-    # If the source already IS the local copy, no need to robocopy.
-    if ([System.IO.Path]::GetFullPath($SourcePath) -ieq [System.IO.Path]::GetFullPath($dest)) {
-        Write-Host "-RemoteVHDXPath already resides in $localVhdRoot; using it as-is."
-        return $dest
-    }
-
-    Write-Host "Robocopy (remote): $srcDir\$fileName  ->  $localVhdRoot"
-    robocopy $srcDir $localVhdRoot $fileName /Z /J /R:3 /W:5 | Out-Host
-
-    # Robocopy exit codes 0-7 indicate success; 8+ indicate failure.
-    if ($LASTEXITCODE -ge 8) {
-        throw "Robocopy failed with exit code $LASTEXITCODE"
-    }
-    $global:LASTEXITCODE = 0
-
-    return $dest
-}
 function ConvertTo-XmlSafe {
     param([string]$Text)
     return ($Text -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;' `
@@ -475,6 +378,39 @@ function Copy-FilesToGuest {
     finally {
         Remove-PSSession $session -ErrorAction SilentlyContinue
     }
+}
+
+# ---- Helper: run Install-ContainerdHnsVfp.ps1 INSIDE the guest ----
+function Invoke-GuestContainerdInstall {
+    param(
+        [Parameter(Mandatory)][string]$VMName,
+        [Parameter(Mandatory)][pscredential]$Credential,
+        [string]$GuestScriptPath = 'C:\scripts\Install-ContainerdHnsVfp.ps1',
+        [ValidateSet('l2bridge', 'overlay', 'nat')][string]$NetworkMode = 'l2bridge',
+        [ValidateSet('hyperv', 'process')][string]$ContainerIsolation = 'hyperv',
+        [bool]$RunValidation = $false,
+        [int]$ReadyTimeoutMinutes = 30
+    )
+
+    if (-not (Wait-GuestReady -VMName $VMName -Credential $Credential -TimeoutMinutes $ReadyTimeoutMinutes)) {
+        throw "Guest '$VMName' did not become reachable within $ReadyTimeoutMinutes minutes."
+    }
+
+    Write-Host "Running '$GuestScriptPath' inside guest '$VMName' (NetworkMode=$NetworkMode, ContainerIsolation=$ContainerIsolation, RunValidation=$RunValidation)..."
+    Invoke-Command -VMName $VMName -Credential $Credential -ScriptBlock {
+        param($scriptPath, $networkMode, $containerIsolation, $runValidation)
+        if (-not (Test-Path $scriptPath)) {
+            throw "Installer not found in guest: $scriptPath (ensure Install-ContainerdHnsVfp.ps1 is in `$HostFilesToCopy)."
+        }
+        Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+        $splat = @{
+            NetworkMode        = $networkMode
+            ContainerIsolation = $containerIsolation
+        }
+        if ($runValidation) { $splat['RunValidation'] = $true }
+        & $scriptPath @splat
+    } -ArgumentList $GuestScriptPath, $NetworkMode, $ContainerIsolation, $RunValidation
+    Write-Host "In-guest containerd/HNS/VFP installation complete."
 }
 
 # ---- Helper: in-guest SDN role/feature install + VFP switch extension ----
@@ -924,29 +860,12 @@ if (Get-VM -Name $vmName -ErrorAction SilentlyContinue) {
 # ---- Resolve the VHDX to use ----
 $resolvedVhdx = $null
 
-if ($VHDXPath) {
-    # Explicit path wins: ignore -Branch.
-    if (-not (Test-Path $VHDXPath)) {
-        throw "Specified -VHDXPath does not exist: $VHDXPath"
-    }
-    Write-Host "Using explicitly provided VHDX: $VHDXPath"
-    $resolvedVhdx = $VHDXPath
+# Explicit VHDX path is now the only supported base-disk source.
+if (-not (Test-Path $VHDXPath)) {
+    throw "Specified -VHDXPath does not exist: $VHDXPath"
 }
-elseif ($RemoteVHDXPath) {
-    # Robocopy the given vhdx into C:\VHDs, then use the local copy as the base.
-    Write-Host "Copying -RemoteVHDXPath into $localVhdRoot ..."
-    $resolvedVhdx = Copy-RemoteVhdxLocally -SourcePath $RemoteVHDXPath
-}
-elseif ($Branch) {
-    # Always copy the LATEST vhdx for the branch from winbuilds.
-    Write-Host "Fetching latest vhdx for branch '$Branch' from winbuilds..."
-    $latest = Get-LatestWinbuildsVhdx -Branch $Branch
-    if (-not $latest) { throw "No vhdx found on winbuilds for branch '$Branch'." }
-    $resolvedVhdx = Copy-VhdxLocally -VhdxFile $latest
-}
-else {
-    throw "Provide either -VHDXPath, -RemoteVHDXPath, or -Branch."
-}
+Write-Host "Using explicitly provided VHDX: $VHDXPath"
+$resolvedVhdx = $VHDXPath
 
 if (-not (Test-Path $resolvedVhdx)) {
     throw "Resolved vhdx path does not exist: $resolvedVhdx"
@@ -1028,8 +947,14 @@ else {
     Write-Host "`$L1VmAdminPassword is empty; skipping unattend.xml injection (manual first-boot setup)."
 }
 
-# ---- Use the existing External virtual switch (create one if none exists) ----
-$switchName = (Get-VMSwitch | Where-Object SwitchType -eq 'External' | Select-Object -First 1).Name
+# ---- Pick a virtual switch: prefer the built-in 'Default Switch', then any External switch ----
+$switchName = (Get-VMSwitch | Where-Object Name -eq 'Default Switch' | Select-Object -First 1).Name
+if ($switchName) {
+    Write-Host "'Default Switch' already exists; skipping External switch creation."
+}
+if (-not $switchName) {
+    $switchName = (Get-VMSwitch | Where-Object SwitchType -eq 'External' | Select-Object -First 1).Name
+}
 if (-not $switchName) {
     Write-Host "No External virtual switch found. Creating one..."
 
@@ -1120,6 +1045,10 @@ if ($L1VmAdminPassword -and -not $SkipGuestSetup) {
     Write-Host "Guest SDN/VFP configuration complete."
 
     # ---- Copy host helper scripts into the guest (e.g. Create-L2Vm-Linux.ps1) ----
+    if ($InstallContainerd -and ($HostFilesToCopy -notcontains 'Install-ContainerdHnsVfp.ps1')) {
+        # Guarantee the installer is staged in the guest before we invoke it.
+        $HostFilesToCopy += 'Install-ContainerdHnsVfp.ps1'
+    }
     if ($HostFilesToCopy -and $HostFilesToCopy.Count -gt 0) {
         $scriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
         Write-Host "Copying host files into guest '$GuestScriptsDir'..."
@@ -1128,6 +1057,17 @@ if ($L1VmAdminPassword -and -not $SkipGuestSetup) {
                           -HostFiles $HostFilesToCopy `
                           -GuestDir $GuestScriptsDir `
                           -ScriptRoot $scriptRoot
+    }
+
+    # ---- Optionally install containerd + HNS + VFP + crictl inside the guest ----
+    if ($InstallContainerd) {
+        Invoke-GuestContainerdInstall -VMName $vmName `
+                                      -Credential $guestCred `
+                                      -GuestScriptPath (Join-Path $GuestScriptsDir 'Install-ContainerdHnsVfp.ps1') `
+                                      -NetworkMode $NetworkMode `
+                                      -ContainerIsolation $ContainerIsolation `
+                                      -RunValidation:$RunContainerdValidation `
+                                      -ReadyTimeoutMinutes $GuestReadyTimeoutMinutes
     }
 }
 elseif ($SkipGuestSetup) {
